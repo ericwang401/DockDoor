@@ -291,12 +291,13 @@ class WindowManipulationObservers {
                 self?.previewCoordinator.windowSwitcherCoordinator.setFocusedWindowID(focusedWindowID)
             }
             updateTimestampIfAppActive(element: element, app: app)
+            let windowID = try? element.cgWindowId()
+            let position = try? element.position()
             handleWindowEvent(element: element, app: app, notification: notificationName, validate: false) { [weak self] windowSet in
                 guard let self else { return }
-                let windowID = try? element.cgWindowId()
                 update(windowSet: &windowSet, matching: windowID, element: element) { window in
                     window.spaceID = window.id.cgsSpaces().first.map { Int($0) }
-                    if let pos = try? element.position() {
+                    if let pos = position {
                         window.screenIdentifier = WindowUtil.screenIdentifier(forWindowAt: pos)
                     }
                 }
@@ -307,14 +308,16 @@ class WindowManipulationObservers {
             }
             handleWindowEvent(element: element, app: app, notification: notificationName, validate: true)
         case kAXWindowResizedNotification, kAXWindowMovedNotification:
+            let windowID = try? element.cgWindowId()
+            let position = try? element.position()
+            let size = try? element.size()
             handleWindowEvent(element: element, app: app, notification: notificationName, validate: false) { [weak self] windowSet in
                 guard let self else { return }
-                let windowID = try? element.cgWindowId()
                 update(windowSet: &windowSet, matching: windowID, element: element) { window in
                     window.spaceID = window.id.cgsSpaces().first.map { Int($0) }
-                    if let pos = try? element.position() {
+                    if let pos = position {
                         window.screenIdentifier = WindowUtil.screenIdentifier(forWindowAt: pos)
-                        if let size = try? element.size() {
+                        if let size {
                             window.frame = CGRect(origin: pos, size: size)
                         }
                     }
@@ -352,12 +355,16 @@ class WindowManipulationObservers {
                 }
             }
         case kAXApplicationShownNotification:
+            let positions = Dictionary(
+                WindowUtil.readCachedWindows(for: pid).map { ($0.id, try? $0.axElement.position()) },
+                uniquingKeysWith: { first, _ in first }
+            )
             handleWindowEvent(element: element, app: app, notification: notificationName, validate: true) { windowSet in
                 windowSet = Set(windowSet.map { window in
                     var updated = window
                     updated.isHidden = false
                     updated.spaceID = updated.id.cgsSpaces().first.map { Int($0) }
-                    if let pos = try? updated.axElement.position() {
+                    if let pos = positions[updated.id] ?? nil {
                         updated.screenIdentifier = WindowUtil.screenIdentifier(forWindowAt: pos)
                     }
                     return updated
@@ -381,13 +388,13 @@ class WindowManipulationObservers {
                 }
                 return
             }
+            guard let role = try? element.role(), role == kAXWindowRole as String,
+                  let freshTitle = try? element.title(), !freshTitle.isEmpty
+            else { return }
             handleWindowEvent(element: element, app: app, notification: notificationName, validate: false) { [weak self] windowSet in
                 guard let self else { return }
-                guard let role = try? element.role(), role == kAXWindowRole as String else { return }
                 update(windowSet: &windowSet, matching: windowID, element: element) { window in
-                    if let freshTitle = try? window.axElement.title(), !freshTitle.isEmpty {
-                        window.windowName = freshTitle
-                    }
+                    window.windowName = freshTitle
                 }
             }
         default:
@@ -427,10 +434,12 @@ class WindowManipulationObservers {
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             DebugLogger.measure("updateWindowCache", details: "App: \(app.localizedName ?? "Unknown"), Notification: \(notification), Validate: \(effectiveValidate)") {
+                // AX validation can block for seconds on a busy app, so it runs before taking the cache lock that the switcher reads under.
+                let invalidWindowIDs = effectiveValidate ? WindowUtil.invalidCachedWindowIDs(for: app.processIdentifier) : []
                 WindowUtil.updateWindowCache(for: app) { windowSet in
                     let previousWindows = windowSet
                     if effectiveValidate {
-                        windowSet = windowSet.filter { WindowUtil.isValidElement($0.axElement) }
+                        windowSet = windowSet.filter { !invalidWindowIDs.contains($0.id) }
                     }
                     stateAdjustment?(&windowSet)
                     if effectiveValidate, !previousWindows.isEmpty, windowSet.isEmpty {
@@ -472,12 +481,14 @@ func axObserverCallback(observer: AXObserver, element: AXUIElement, notification
     guard let userData else { return }
     let pid = pid_t(Int(bitPattern: userData))
     let notification = notificationName as String
-    var key = "\(pid)-\(notification)"
-    if notification == kAXTitleChangedNotification, let windowID = try? element.cgWindowId() {
-        key += "-\(windowID)"
-    }
 
+    // Callbacks arrive on the main run loop; the window ID lookup is AX IPC, so it happens on the work queue.
     axObserverWorkQueue.async {
+        var key = "\(pid)-\(notification)"
+        if notification == kAXTitleChangedNotification, let windowID = try? element.cgWindowId() {
+            key += "-\(windowID)"
+        }
+
         if notification == kAXWindowCreatedNotification,
            let app = NSRunningApplication(processIdentifier: pid),
            let observerInstance = activeWindowManipulationObserversInstance

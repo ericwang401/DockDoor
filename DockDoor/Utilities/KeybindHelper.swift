@@ -953,12 +953,13 @@ class KeybindHelper {
                         self.previewCoordinator.selectAndBringToFrontCurrentWindow()
                         self.windowSwitchingCoordinator.cancelSwitching(previewCoordinator: self.previewCoordinator)
                     } else if let selectedWindow = self.windowSwitchingCoordinator.selectCurrentWindow(previewCoordinator: self.previewCoordinator) {
+                        // Dismiss before activating so the overlay never lingers while the target app responds.
+                        self.previewCoordinator.hideWindow()
                         selectedWindow.bringToFront()
                         selectedWindow.warpMouseToCenterIfNeeded()
                         if selectedWindow.isWindowlessApp, Defaults[.openNewWindowForWindowlessApps] {
                             WindowUtil.activateAndOpenNewWindow(app: selectedWindow.app)
                         }
-                        self.previewCoordinator.hideWindow()
                     }
                 }
             }

@@ -369,6 +369,10 @@ extension WindowUtil {
         desktopSpaceWindowCacheManager.writeCache(pid: app.processIdentifier, windowSet: [])
     }
 
+    static func invalidCachedWindowIDs(for pid: pid_t) -> Set<CGWindowID> {
+        Set(desktopSpaceWindowCacheManager.readCache(pid: pid).filter { !isValidElement($0.axElement) }.map(\.id))
+    }
+
     static func updateWindowCache(for app: NSRunningApplication, update: @escaping (inout Set<WindowInfo>) -> Void) {
         desktopSpaceWindowCacheManager.updateCache(pid: app.processIdentifier, update: update)
     }
@@ -387,8 +391,8 @@ extension WindowUtil {
             return // Skip update
         }
 
+        let windowID = try? element.cgWindowId()
         desktopSpaceWindowCacheManager.updateCache(pid: app.processIdentifier) { windowSet in
-            let windowID = try? element.cgWindowId()
             if let index = windowSet.firstIndex(where: { cachedWindow in
                 if cachedWindow.axElement == element {
                     return true
@@ -774,14 +778,45 @@ extension WindowUtil {
         }
     }
 
+    private static let activationPolicyCacheLock = NSLock()
+    private static var activationPolicyCache: [pid_t: NSApplication.ActivationPolicy] = [:]
+
+    // `activationPolicy` is a synchronous LaunchServices round trip per process, and the switcher asks it of every running process on each open.
+    private static func isRegularApp(_ app: NSRunningApplication) -> Bool {
+        let pid = app.processIdentifier
+        activationPolicyCacheLock.lock()
+        let cached = activationPolicyCache[pid]
+        activationPolicyCacheLock.unlock()
+        if let cached { return cached == .regular }
+
+        let policy = app.activationPolicy
+        activationPolicyCacheLock.lock()
+        activationPolicyCache[pid] = policy
+        activationPolicyCacheLock.unlock()
+        return policy == .regular
+    }
+
+    private static func refreshActivationPolicyCache() {
+        DispatchQueue.global(qos: .utility).async {
+            let fresh = Dictionary(
+                NSWorkspace.shared.runningApplications.map { ($0.processIdentifier, $0.activationPolicy) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            activationPolicyCacheLock.lock()
+            activationPolicyCache = fresh
+            activationPolicyCacheLock.unlock()
+        }
+    }
+
     static func getWindowlessRunningApps(existingWindows: [WindowInfo]) -> [WindowInfo] {
         let pidsWithWindows = Set(existingWindows.map(\.app.processIdentifier))
         let ownBundleId = Bundle.main.bundleIdentifier
+        defer { refreshActivationPolicyCache() }
 
         return NSWorkspace.shared.runningApplications
             .filter { app in
-                app.activationPolicy == .regular &&
-                    !pidsWithWindows.contains(app.processIdentifier) &&
+                !pidsWithWindows.contains(app.processIdentifier) &&
+                    isRegularApp(app) &&
                     !WindowOwnerResolver.isAuxiliaryOwner(app) &&
                     !filteredBundleIdentifiers.contains(app.bundleIdentifier ?? "") &&
                     !isAppFiltered(app) &&

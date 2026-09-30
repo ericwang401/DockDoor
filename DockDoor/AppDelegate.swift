@@ -108,6 +108,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard self != nil else { return }
 
             await WindowUtil.updateAllWindowsInCurrentSpace()
+
+            if Defaults[.enableWindowSwitcher] {
+                await MainActor.run { self?.previewCoordinator?.prewarmSwitcherView() }
+            }
         }
 
         // Cold-start: seed all windows (including minimized and other Spaces) and start live AX tracker

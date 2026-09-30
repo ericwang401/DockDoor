@@ -26,6 +26,8 @@ final class SharedPreviewWindowCoordinator: NSPanel {
     private var fullPreviewWindow: NSPanel?
     private var activeFullPreviewHoverID: UUID?
     private var pendingShowWorkItem: DispatchWorkItem?
+    // Kept across switcher sessions so reopening updates the existing view tree instead of rebuilding every card.
+    private var reusableSwitcherHostingView: NSHostingView<WindowPreviewHoverContainer>?
 
     var windowSize: CGSize = getWindowSize()
 
@@ -199,6 +201,11 @@ final class SharedPreviewWindowCoordinator: NSPanel {
 
         searchWindow?.hideSearch()
 
+        let hidingReusableSwitcher = reusableSwitcherHostingView != nil && contentView === reusableSwitcherHostingView
+        if hidingReusableSwitcher, let reusable = reusableSwitcherHostingView {
+            Self.firstSubview(of: CardGridScrollView.ContainerView.self, in: reusable)?.scroll(to: 0, animated: false)
+        }
+
         if let currentContent = contentView {
             currentContent.removeFromSuperview()
         }
@@ -209,9 +216,15 @@ final class SharedPreviewWindowCoordinator: NSPanel {
         anchoredDockItem = nil
         switcherAnchorCenter = nil
 
-        let currentDockPos = DockUtils.getDockPosition()
-        let currentScreen = NSScreen.main ?? NSScreen.screens.first!
-        windowSwitcherCoordinator.setWindows([], dockPosition: currentDockPos, bestGuessMonitor: currentScreen)
+        // The reusable switcher view still observes the coordinator; leaving its windows in place lets the next open diff against them.
+        if hidingReusableSwitcher {
+            windowSwitcherCoordinator.setIndex(to: -1, shouldScroll: false)
+            windowSwitcherCoordinator.isParkedWhileHidden = true
+        } else {
+            let currentDockPos = DockUtils.getDockPosition()
+            let currentScreen = NSScreen.main ?? NSScreen.screens.first!
+            windowSwitcherCoordinator.setWindows([], dockPosition: currentDockPos, bestGuessMonitor: currentScreen)
+        }
         windowSwitcherCoordinator.setShowing(.both, toState: false)
         orderOut(nil)
         publishTapSnapshot()
@@ -354,6 +367,57 @@ final class SharedPreviewWindowCoordinator: NSPanel {
         previousHoverWindowOrigin = position
     }
 
+    // Builds the reusable switcher view off screen so the first Cmd+Tab after launch doesn't pay for creating every card.
+    @MainActor
+    func prewarmSwitcherView() {
+        guard reusableSwitcherHostingView == nil, !isVisible else { return }
+        let windows = WindowUtil.getAllWindowsOfAllApps()
+        guard !windows.isEmpty else { return }
+        let screen = NSScreen.main ?? NSScreen.screens.first!
+        let dockPosition = DockUtils.getDockPosition()
+
+        windowSwitcherCoordinator.setShowing(.windowSwitcher, toState: true)
+        windowSwitcherCoordinator.setWindows(windows, dockPosition: dockPosition, bestGuessMonitor: screen)
+
+        let hoverView = WindowPreviewHoverContainer(appName: "Window Switcher",
+                                                    onWindowTap: nil,
+                                                    dockPosition: dockPosition,
+                                                    mouseLocation: nil,
+                                                    bestGuessMonitor: screen,
+                                                    dockItemElement: nil,
+                                                    dockItemFrameOverride: nil,
+                                                    windowSwitcherCoordinator: windowSwitcherCoordinator,
+                                                    mockPreviewActive: false,
+                                                    updateAvailable: false,
+                                                    embeddedContentType: .none,
+                                                    hasScreenRecordingPermission: hasScreenRecordingPermission)
+        let hostingView = NSHostingView(rootView: hoverView)
+        let size = hostingView.fittingSize
+        reusableSwitcherHostingView = hostingView
+
+        // One invisible, off-screen draw also warms the window's layer tree and uploads the previews, which a detached view never does.
+        contentView = hostingView
+        alphaValue = 0
+        setFrame(CGRect(origin: CGPoint(x: screen.frame.maxX + 10000, y: screen.frame.maxY + 10000), size: size), display: false)
+        orderFront(nil)
+        displayIfNeeded()
+        orderOut(nil)
+        hostingView.removeFromSuperview()
+        contentView = nil
+        alphaValue = 1
+
+        windowSwitcherCoordinator.setShowing(.windowSwitcher, toState: false)
+        windowSwitcherCoordinator.isParkedWhileHidden = true
+    }
+
+    private static func firstSubview<T: NSView>(of type: T.Type, in view: NSView) -> T? {
+        for subview in view.subviews {
+            if let match = subview as? T { return match }
+            if let match = firstSubview(of: type, in: subview) { return match }
+        }
+        return nil
+    }
+
     @MainActor
     private func updateContentViewSizeAndPosition(mouseLocation: CGPoint? = nil, mouseScreen: NSScreen, dockItemElement: AXUIElement?,
                                                   dockIconRect: CGRect? = nil,
@@ -387,12 +451,21 @@ final class SharedPreviewWindowCoordinator: NSPanel {
                                                     updateAvailable: updateAvailable,
                                                     embeddedContentType: embeddedContentType,
                                                     hasScreenRecordingPermission: hasScreenRecordingPermission)
-        let newHostingView = NSHostingView(rootView: hoverView)
-
-        if let oldContentView = contentView {
-            oldContentView.removeFromSuperview()
+        let newHostingView: NSHostingView<WindowPreviewHoverContainer>
+        if windowSwitcherCoordinator.windowSwitcherActive, let reusable = reusableSwitcherHostingView {
+            reusable.rootView = hoverView
+            newHostingView = reusable
+        } else {
+            newHostingView = NSHostingView(rootView: hoverView)
+            if windowSwitcherCoordinator.windowSwitcherActive {
+                reusableSwitcherHostingView = newHostingView
+            }
         }
-        contentView = newHostingView
+
+        if contentView !== newHostingView {
+            contentView?.removeFromSuperview()
+            contentView = newHostingView
+        }
 
         elapsed = renderStartTime.map { (CFAbsoluteTimeGetCurrent() - $0) * 1000 } ?? 0
         DebugLogger.log("PreviewRender", details: "calculating fittingSize (+\(String(format: "%.1f", elapsed))ms)")
@@ -903,14 +976,14 @@ final class SharedPreviewWindowCoordinator: NSPanel {
         }
 
         let selectedWindow = coordinator.windows[currentIndex]
+        // Dismiss before activating so the overlay never lingers while the target app responds.
+        hideWindow()
         selectedWindow.bringToFront()
         selectedWindow.warpMouseToCenterIfNeeded()
 
         if selectedWindow.isWindowlessApp, Defaults[.openNewWindowForWindowlessApps] {
             WindowUtil.activateAndOpenNewWindow(app: selectedWindow.app)
         }
-
-        hideWindow()
     }
 
     @MainActor

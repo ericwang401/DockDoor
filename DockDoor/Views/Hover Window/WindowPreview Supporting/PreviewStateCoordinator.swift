@@ -65,22 +65,36 @@ class PreviewStateCoordinator: ObservableObject {
         cachedFilteredIndices = nil
     }
 
+    private var focusedWindowGeneration = 0
+
     @MainActor
     func setFocusedWindowID(_ windowID: CGWindowID?) {
+        focusedWindowGeneration += 1
         focusedWindowID = windowID
     }
 
+    // The lookup is an AX round trip to the frontmost app, which can take hundreds of ms when that app is busy, so it never runs on main.
     @MainActor
     func refreshFocusedWindowID(from newWindows: [WindowInfo]? = nil) {
-        focusedWindowID = Self.currentFocusedWindowID(in: newWindows ?? windows)
+        focusedWindowGeneration += 1
+        let generation = focusedWindowGeneration
+        guard let appAxElement = (newWindows ?? windows).first(where: { $0.app.isActive })?.appAxElement else {
+            focusedWindowID = nil
+            return
+        }
+        Task { @MainActor [weak self] in
+            let windowID = await Self.focusedWindowID(of: appAxElement)
+            guard let self, generation == focusedWindowGeneration else { return }
+            focusedWindowID = windowID
+        }
     }
 
-    private static func currentFocusedWindowID(in windows: [WindowInfo]) -> CGWindowID? {
-        guard let activeAppWindow = windows.first(where: { $0.app.isActive }),
-              let focusedWindow = try? activeAppWindow.appAxElement.focusedWindow()
-        else { return nil }
-        return try? focusedWindow.cgWindowId()
+    private nonisolated static func focusedWindowID(of appAxElement: AXUIElement) async -> CGWindowID? {
+        (try? appAxElement.focusedWindow()).flatMap { try? $0.cgWindowId() }
     }
+
+    // Set while the switcher's windows are kept around after hiding for view reuse; the next open replaces them, so cache changes in between are skipped.
+    var isParkedWhileHidden = false
 
     var hasActiveSearch: Bool {
         !searchQuery.isEmpty
@@ -154,6 +168,7 @@ class PreviewStateCoordinator: ObservableObject {
 
     @MainActor
     func setWindows(_ newWindows: [WindowInfo], dockPosition: DockPosition, bestGuessMonitor: NSScreen, isMockPreviewActive: Bool = false) {
+        isParkedWhileHidden = false
         windows = newWindows
         refreshFocusedWindowID(from: newWindows)
         lastKnownBestGuessMonitor = bestGuessMonitor
@@ -226,7 +241,7 @@ class PreviewStateCoordinator: ObservableObject {
 
     @MainActor
     func applyCacheChanges(removed: [WindowInfo], added: [WindowInfo], updated: [WindowInfo]) {
-        guard !windows.isEmpty else { return }
+        guard !windows.isEmpty, !isParkedWhileHidden else { return }
 
         if !updated.isEmpty {
             var merged = windows
